@@ -2,6 +2,7 @@ import graphene
 from django.core.exceptions import ValidationError
 
 from ....account.models import User
+from ....core.permissions import OrderPermissions
 from ....core.taxes import zero_taxed_money
 from ....order import events, models
 from ....order.actions import (
@@ -17,17 +18,15 @@ from ....order.error_codes import OrderErrorCode
 from ....order.utils import get_valid_shipping_methods_for_order
 from ....payment import CustomPaymentChoices, PaymentError, gateway
 from ...account.types import AddressInput
-from ...core.mutations import (
-    BaseMutation,
-    ClearMetaBaseMutation,
-    UpdateMetaBaseMutation,
-)
+from ...core.mutations import BaseMutation
 from ...core.scalars import Decimal
-from ...core.types import MetaInput, MetaPath
 from ...core.types.common import OrderError
+from ...meta.deprecated.mutations import ClearMetaBaseMutation, UpdateMetaBaseMutation
+from ...meta.deprecated.types import MetaInput, MetaPath
 from ...order.mutations.draft_orders import DraftOrderUpdate
 from ...order.types import Order, OrderEvent
 from ...shipping.types import ShippingMethod
+from ...utils import get_user_or_app_from_context
 
 
 def clean_order_update_shipping(order, method):
@@ -150,9 +149,21 @@ class OrderUpdate(DraftOrderUpdate):
     class Meta:
         description = "Updates an order."
         model = models.Order
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
         error_type_class = OrderError
         error_type_field = "order_errors"
+
+    @classmethod
+    def clean_input(cls, info, instance, data):
+        draft_order_cleaned_input = super().clean_input(info, instance, data)
+
+        # We must to filter out field added by DraftOrderUpdate
+        editable_fields = ["billing_address", "shipping_address", "user_email"]
+        cleaned_input = {}
+        for key in draft_order_cleaned_input:
+            if key in editable_fields:
+                cleaned_input[key] = draft_order_cleaned_input[key]
+        return cleaned_input
 
     @classmethod
     def save(cls, info, instance, cleaned_input):
@@ -184,7 +195,7 @@ class OrderUpdateShipping(BaseMutation):
 
     class Meta:
         description = "Updates a shipping method of the order."
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
         error_type_class = OrderError
         error_type_field = "order_errors"
 
@@ -228,7 +239,7 @@ class OrderUpdateShipping(BaseMutation):
         clean_order_update_shipping(order, method)
 
         order.shipping_method = method
-        order.shipping_price = info.context.extensions.calculate_order_shipping(order)
+        order.shipping_price = info.context.plugins.calculate_order_shipping(order)
         order.shipping_method_name = method.name
         order.save(
             update_fields=[
@@ -245,7 +256,9 @@ class OrderUpdateShipping(BaseMutation):
 
 
 class OrderAddNoteInput(graphene.InputObjectType):
-    message = graphene.String(description="Note message.", name="message")
+    message = graphene.String(
+        description="Note message.", name="message", required=True
+    )
 
 
 class OrderAddNote(BaseMutation):
@@ -264,15 +277,32 @@ class OrderAddNote(BaseMutation):
 
     class Meta:
         description = "Adds note to the order."
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
         error_type_class = OrderError
         error_type_field = "order_errors"
 
     @classmethod
+    def clean_input(cls, _info, _instance, data):
+        message = data["input"]["message"].strip()
+        if not message:
+            raise ValidationError(
+                {
+                    "message": ValidationError(
+                        "Message can't be empty.", code=OrderErrorCode.REQUIRED,
+                    )
+                }
+            )
+        data["input"]["message"] = message
+        return data
+
+    @classmethod
     def perform_mutation(cls, _root, info, **data):
         order = cls.get_node_or_error(info, data.get("id"), only_type=Order)
+        cleaned_input = cls.clean_input(info, order, data)
         event = events.order_note_added_event(
-            order=order, user=info.context.user, message=data.get("input")["message"]
+            order=order,
+            user=info.context.user,
+            message=cleaned_input["input"]["message"],
         )
         return OrderAddNote(order=order, event=event)
 
@@ -282,21 +312,19 @@ class OrderCancel(BaseMutation):
 
     class Arguments:
         id = graphene.ID(required=True, description="ID of the order to cancel.")
-        restock = graphene.Boolean(
-            required=True, description="Determine if lines will be restocked or not."
-        )
 
     class Meta:
         description = "Cancel an order."
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
         error_type_class = OrderError
         error_type_field = "order_errors"
 
     @classmethod
-    def perform_mutation(cls, _root, info, restock, **data):
+    def perform_mutation(cls, _root, info, **data):
         order = cls.get_node_or_error(info, data.get("id"), only_type=Order)
         clean_order_cancel(order)
-        cancel_order(order=order, user=info.context.user, restock=restock)
+        requester = get_user_or_app_from_context(info.context)
+        cancel_order(order=order, user=requester)
         return OrderCancel(order=order)
 
 
@@ -308,14 +336,23 @@ class OrderMarkAsPaid(BaseMutation):
 
     class Meta:
         description = "Mark order as manually paid."
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
         error_type_class = OrderError
         error_type_field = "order_errors"
+
+    @classmethod
+    def clean_billing_address(cls, instance):
+        if not instance.billing_address:
+            raise ValidationError(
+                "Order billing address is required to mark order as paid.",
+                code=OrderErrorCode.BILLING_ADDRESS_NOT_SET,
+            )
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):
         order = cls.get_node_or_error(info, data.get("id"), only_type=Order)
 
+        cls.clean_billing_address(order)
         try_payment_action(
             order, info.context.user, None, clean_mark_order_as_paid, order
         )
@@ -333,7 +370,7 @@ class OrderCapture(BaseMutation):
 
     class Meta:
         description = "Capture an order."
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
         error_type_class = OrderError
         error_type_field = "order_errors"
 
@@ -369,7 +406,7 @@ class OrderVoid(BaseMutation):
 
     class Meta:
         description = "Void an order."
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
         error_type_class = OrderError
         error_type_field = "order_errors"
 
@@ -393,7 +430,7 @@ class OrderRefund(BaseMutation):
 
     class Meta:
         description = "Refund an order."
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
         error_type_class = OrderError
         error_type_field = "order_errors"
 
@@ -446,7 +483,7 @@ class OrderUpdatePrivateMeta(UpdateMetaBaseMutation):
     class Meta:
         description = "Updates private meta for order."
         model = models.Order
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
         public = False
 
 
@@ -454,7 +491,7 @@ class OrderClearMeta(ClearMetaBaseMutation):
     class Meta:
         description = "Clears stored metadata value."
         model = models.Order
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
         public = True
 
     class Arguments:
@@ -474,5 +511,5 @@ class OrderClearPrivateMeta(ClearMetaBaseMutation):
     class Meta:
         description = "Clears stored private metadata value."
         model = models.Order
-        permissions = ("order.manage_orders",)
+        permissions = (OrderPermissions.MANAGE_ORDERS,)
         public = False

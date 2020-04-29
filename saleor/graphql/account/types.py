@@ -1,23 +1,25 @@
 import graphene
-import graphene_django_optimizer as gql_optimizer
-from django.contrib.auth import get_user_model
+from django.contrib.auth import get_user_model, models as auth_models
 from graphene import relay
 from graphene_federation import key
-from graphql_jwt.decorators import login_required
+from graphql_jwt.exceptions import PermissionDenied
 
 from ...account import models
 from ...checkout.utils import get_user_checkout
-from ...core.permissions import get_permissions
+from ...core.permissions import AccountPermissions, OrderPermissions
 from ...order import models as order_models
 from ..checkout.types import Checkout
 from ..core.connection import CountableDjangoObjectType
 from ..core.fields import PrefetchingConnectionField
-from ..core.resolvers import resolve_meta, resolve_private_meta
-from ..core.types import CountryDisplay, Image, MetadataObjectType, PermissionDisplay
-from ..core.utils import get_node_optimized
-from ..decorators import one_of_permissions_required
+from ..core.types import CountryDisplay, Image, Permission
+from ..core.utils import from_global_id_strict_type
+from ..decorators import one_of_permissions_required, permission_required
+from ..meta.deprecated.resolvers import resolve_meta, resolve_private_meta
+from ..meta.types import ObjectWithMetadata
 from ..utils import format_permissions_for_display
+from ..wishlist.resolvers import resolve_wishlist_items_from_user
 from .enums import CountryCodeEnum, CustomerEventsEnum
+from .utils import can_user_manage_group, get_groups_which_user_can_manage
 
 
 class AddressInput(graphene.InputObjectType):
@@ -117,18 +119,11 @@ class CustomerEvent(CountableDjangoObjectType):
         description="Date when event happened at in ISO 8601 format."
     )
     type = CustomerEventsEnum(description="Customer event type.")
-    user = graphene.Field(
-        lambda: User,
-        id=graphene.Argument(graphene.ID),
-        description="User who performed the action.",
-    )
+    user = graphene.Field(lambda: User, description="User who performed the action.")
     message = graphene.String(description="Content of the event.")
     count = graphene.Int(description="Number of objects concerned by the event.")
-    order = gql_optimizer.field(
-        graphene.Field(
-            "saleor.graphql.order.types.Order", description="The concerned order."
-        ),
-        model_field="order",
+    order = graphene.Field(
+        "saleor.graphql.order.types.Order", description="The concerned order."
     )
     order_line = graphene.Field(
         "saleor.graphql.order.types.OrderLine", description="The concerned order line."
@@ -139,6 +134,17 @@ class CustomerEvent(CountableDjangoObjectType):
         model = models.CustomerEvent
         interfaces = [relay.Node]
         only_fields = ["id"]
+
+    @staticmethod
+    def resolve_user(root: models.CustomerEvent, info):
+        user = info.context.user
+        if (
+            user == root.user
+            or user.has_perm(AccountPermissions.MANAGE_USERS)
+            or user.has_perm(AccountPermissions.MANAGE_STAFF)
+        ):
+            return root.user
+        raise PermissionDenied()
 
     @staticmethod
     def resolve_message(root: models.CustomerEvent, _info):
@@ -154,112 +160,69 @@ class CustomerEvent(CountableDjangoObjectType):
             try:
                 qs = order_models.OrderLine.objects
                 order_line_pk = root.parameters["order_line_pk"]
-                return get_node_optimized(qs, {"pk": order_line_pk}, info)
+                return qs.filter(pk=order_line_pk).first()
             except order_models.OrderLine.DoesNotExist:
                 pass
         return None
 
 
-class ServiceAccountToken(CountableDjangoObjectType):
-    name = graphene.String(description="Name of the authenticated token.")
-    auth_token = graphene.String(description="Last 4 characters of the token.")
-
-    class Meta:
-        description = "Represents token data."
-        model = models.ServiceAccountToken
-        interfaces = [relay.Node]
-        permissions = ("account.manage_service_accounts",)
-        only_fields = ["name", "auth_token"]
-
-    @staticmethod
-    def resolve_auth_token(root: models.ServiceAccount, _info, **_kwargs):
-        return root.auth_token[-4:]
-
-
-@key(fields="id")
-class ServiceAccount(MetadataObjectType, CountableDjangoObjectType):
-    permissions = graphene.List(
-        PermissionDisplay, description="List of the service's permissions."
-    )
-    created = graphene.DateTime(
-        description="The date and time when the service account was created."
-    )
-    is_active = graphene.Boolean(
-        description="Determine if service account will be set active or not."
-    )
-    name = graphene.String(description="Name of the service account.")
-
-    tokens = graphene.List(
-        ServiceAccountToken, description="Last 4 characters of the tokens."
+class UserPermission(Permission):
+    source_permission_groups = graphene.List(
+        graphene.NonNull("saleor.graphql.account.types.Group"),
+        description="List of user permission groups which contains this permission.",
+        user_id=graphene.Argument(
+            graphene.ID,
+            description="ID of user whose groups should be returned.",
+            required=True,
+        ),
+        required=False,
     )
 
-    class Meta:
-        description = "Represents service account data."
-        interfaces = [relay.Node]
-        model = models.ServiceAccount
-        permissions = ("account.manage_service_accounts",)
-        only_fields = [
-            "name" "permissions",
-            "created",
-            "is_active",
-            "tokens",
-            "id",
-            "tokens",
-        ]
-
-    @staticmethod
-    def resolve_permissions(root: models.ServiceAccount, _info, **_kwargs):
-        permissions = root.permissions.prefetch_related("content_type").order_by(
-            "codename"
+    def resolve_source_permission_groups(root: Permission, _info, user_id, **_kwargs):
+        user_id = from_global_id_strict_type(user_id, only_type="User", field="pk")
+        groups = auth_models.Group.objects.filter(
+            user__pk=user_id, permissions__name=root.name
         )
-        return format_permissions_for_display(permissions)
-
-    @staticmethod
-    @gql_optimizer.resolver_hints(prefetch_related="tokens")
-    def resolve_tokens(root: models.ServiceAccount, _info, **_kwargs):
-        return root.tokens.all()
-
-    @staticmethod
-    def resolve_meta(root, info):
-        return resolve_meta(root, info)
-
-    @staticmethod
-    def __resolve_reference(root, _info, **_kwargs):
-        return graphene.Node.get_node_from_global_id(_info, root.id)
+        return groups
 
 
-@key(fields="id")
-class User(MetadataObjectType, CountableDjangoObjectType):
-    addresses = gql_optimizer.field(
-        graphene.List(Address, description="List of all user's addresses."),
-        model_field="addresses",
-    )
+@key("id")
+@key("email")
+class User(CountableDjangoObjectType):
+    addresses = graphene.List(Address, description="List of all user's addresses.")
     checkout = graphene.Field(
         Checkout, description="Returns the last open checkout of this user."
     )
-    gift_cards = gql_optimizer.field(
-        PrefetchingConnectionField(
-            "saleor.graphql.giftcard.types.GiftCard",
-            description="List of the user gift cards.",
-        ),
-        model_field="gift_cards",
+    gift_cards = PrefetchingConnectionField(
+        "saleor.graphql.giftcard.types.GiftCard",
+        description="List of the user gift cards.",
     )
     note = graphene.String(description="A note about the customer.")
-    orders = gql_optimizer.field(
-        PrefetchingConnectionField(
-            "saleor.graphql.order.types.Order", description="List of user's orders."
-        ),
-        model_field="orders",
+    orders = PrefetchingConnectionField(
+        "saleor.graphql.order.types.Order", description="List of user's orders."
     )
+    # deprecated, to remove in #5389
     permissions = graphene.List(
-        PermissionDisplay, description="List of user's permissions."
+        Permission,
+        description="List of user's permissions.",
+        deprecation_reason=(
+            "Will be removed in Saleor 2.11." "Use the `userPermissions` instead."
+        ),
+    )
+    user_permissions = graphene.List(
+        UserPermission, description="List of user's permissions."
+    )
+    permission_groups = graphene.List(
+        "saleor.graphql.account.types.Group",
+        description="List of user's permission groups.",
+    )
+    editable_groups = graphene.List(
+        "saleor.graphql.account.types.Group",
+        description="List of user's permission groups which user can manage.",
     )
     avatar = graphene.Field(Image, size=graphene.Int(description="Size of the avatar."))
-    events = gql_optimizer.field(
-        graphene.List(
-            CustomerEvent, description="List of events associated with the user."
-        ),
-        model_field="events",
+    events = graphene.List(
+        CustomerEvent, description="List of events associated with the user."
     )
     stored_payment_sources = graphene.List(
         "saleor.graphql.payment.types.PaymentSource",
@@ -268,7 +231,7 @@ class User(MetadataObjectType, CountableDjangoObjectType):
 
     class Meta:
         description = "Represents user data."
-        interfaces = [relay.Node]
+        interfaces = [relay.Node, ObjectWithMetadata]
         model = get_user_model()
         only_fields = [
             "date_joined",
@@ -282,7 +245,6 @@ class User(MetadataObjectType, CountableDjangoObjectType):
             "last_login",
             "last_name",
             "note",
-            "token",
         ]
 
     @staticmethod
@@ -299,28 +261,43 @@ class User(MetadataObjectType, CountableDjangoObjectType):
 
     @staticmethod
     def resolve_permissions(root: models.User, _info, **_kwargs):
-        if root.is_superuser:
-            permissions = get_permissions()
-        else:
-            permissions = root.user_permissions.prefetch_related(
-                "content_type"
-            ).order_by("codename")
-        return format_permissions_for_display(permissions)
+        # deprecated, to remove in #5389
+        from .resolvers import resolve_permissions
+
+        return resolve_permissions(root)
 
     @staticmethod
-    @one_of_permissions_required(["account.manage_users", "account.manage_staff"])
+    def resolve_user_permissions(root: models.User, _info, **_kwargs):
+        from .resolvers import resolve_permissions
+
+        return resolve_permissions(root)
+
+    @staticmethod
+    def resolve_permission_groups(root: models.User, _info, **_kwargs):
+        return root.groups.all()
+
+    @staticmethod
+    def resolve_editable_groups(root: models.User, _info, **_kwargs):
+        return get_groups_which_user_can_manage(root)
+
+    @staticmethod
+    @one_of_permissions_required(
+        [AccountPermissions.MANAGE_USERS, AccountPermissions.MANAGE_STAFF]
+    )
     def resolve_note(root: models.User, info):
         return root.note
 
     @staticmethod
-    @one_of_permissions_required(["account.manage_users", "account.manage_staff"])
+    @one_of_permissions_required(
+        [AccountPermissions.MANAGE_USERS, AccountPermissions.MANAGE_STAFF]
+    )
     def resolve_events(root: models.User, info):
         return root.events.all()
 
     @staticmethod
     def resolve_orders(root: models.User, info, **_kwargs):
         viewer = info.context.user
-        if viewer.has_perm("order.manage_orders"):
+        if viewer.has_perm(OrderPermissions.MANAGE_ORDERS):
             return root.orders.all()
         return root.orders.confirmed()
 
@@ -336,24 +313,33 @@ class User(MetadataObjectType, CountableDjangoObjectType):
             )
 
     @staticmethod
-    @login_required
-    def resolve_stored_payment_sources(root: models.User, _info):
+    def resolve_stored_payment_sources(root: models.User, info):
         from .resolvers import resolve_payment_sources
 
-        return resolve_payment_sources(root)
+        if root == info.context.user:
+            return resolve_payment_sources(root)
+        raise PermissionDenied()
 
     @staticmethod
-    @one_of_permissions_required(["account.manage_users", "account.manage_staff"])
-    def resolve_private_meta(root, _info):
+    @one_of_permissions_required(
+        [AccountPermissions.MANAGE_USERS, AccountPermissions.MANAGE_STAFF]
+    )
+    def resolve_private_meta(root: models.User, _info):
         return resolve_private_meta(root, _info)
 
     @staticmethod
-    def resolve_meta(root, _info):
+    def resolve_meta(root: models.User, _info):
         return resolve_meta(root, _info)
 
     @staticmethod
+    def resolve_wishlist(root: models.User, info, **_kwargs):
+        return resolve_wishlist_items_from_user(root)
+
+    @staticmethod
     def __resolve_reference(root, _info, **_kwargs):
-        return graphene.Node.get_node_from_global_id(_info, root.id)
+        if root.id is not None:
+            return graphene.Node.get_node_from_global_id(_info, root.id)
+        return get_user_model().objects.get(email=root.email)
 
 
 class ChoiceValue(graphene.ObjectType):
@@ -379,3 +365,74 @@ class AddressValidationData(graphene.ObjectType):
     postal_code_matchers = graphene.List(graphene.String)
     postal_code_examples = graphene.List(graphene.String)
     postal_code_prefix = graphene.String()
+
+
+class StaffNotificationRecipient(CountableDjangoObjectType):
+    user = graphene.Field(
+        User,
+        description="Returns a user subscribed to email notifications.",
+        required=False,
+    )
+    email = graphene.String(
+        description=(
+            "Returns email address of a user subscribed to email notifications."
+        ),
+        required=False,
+    )
+    active = graphene.Boolean(description="Determines if a notification active.")
+
+    class Meta:
+        description = (
+            "Represents a recipient of email notifications send by Saleor, "
+            "such as notifications about new orders. Notifications can be "
+            "assigned to staff users or arbitrary email addresses."
+        )
+        interfaces = [relay.Node]
+        model = models.StaffNotificationRecipient
+        only_fields = ["user", "active"]
+
+    @staticmethod
+    def resolve_user(root: models.StaffNotificationRecipient, info):
+        user = info.context.user
+        if user == root.user or user.has_perm(AccountPermissions.MANAGE_STAFF):
+            return root.user
+        raise PermissionDenied()
+
+    @staticmethod
+    def resolve_email(root: models.StaffNotificationRecipient, _info):
+        return root.get_email()
+
+
+@key(fields="id")
+class Group(CountableDjangoObjectType):
+    users = graphene.List(User, description="List of group users")
+    permissions = graphene.List(Permission, description="List of group permissions")
+    user_can_manage = graphene.Boolean(
+        required=True,
+        description=(
+            "True, if the currently authenticated user has rights to manage a group."
+        ),
+    )
+
+    class Meta:
+        description = "Represents permission group data."
+        interfaces = [relay.Node]
+        model = auth_models.Group
+        only_fields = ["name", "permissions", "id"]
+
+    @staticmethod
+    @permission_required(AccountPermissions.MANAGE_STAFF)
+    def resolve_users(root: auth_models.Group, _info):
+        return root.user_set.all()
+
+    @staticmethod
+    def resolve_permissions(root: auth_models.Group, _info):
+        permissions = root.permissions.prefetch_related("content_type").order_by(
+            "codename"
+        )
+        return format_permissions_for_display(permissions)
+
+    @staticmethod
+    def resolve_user_can_manage(root: auth_models.Group, info):
+        user = info.context.user
+        return can_user_manage_group(user, root)

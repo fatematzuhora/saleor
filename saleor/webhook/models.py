@@ -1,24 +1,19 @@
 from django.db import models
-from django.utils.translation import pgettext_lazy
 
-from ..account.models import ServiceAccount
+from ..app.models import App
+from ..core.permissions import WebhookPermissions
 
 
 class Webhook(models.Model):
     name = models.CharField(max_length=255, null=True, blank=True)
-    service_account = models.ForeignKey(
-        ServiceAccount, related_name="webhooks", on_delete=models.CASCADE
-    )
+    app = models.ForeignKey(App, related_name="webhooks", on_delete=models.CASCADE)
     target_url = models.URLField(max_length=255)
     is_active = models.BooleanField(default=True)
     secret_key = models.CharField(max_length=255, null=True, blank=True)
 
     class Meta:
         permissions = (
-            (
-                "manage_webhooks",
-                pgettext_lazy("Webhook description", "Manage webhooks"),
-            ),
+            (WebhookPermissions.MANAGE_WEBHOOKS.codename, "Manage webhooks"),
         )
 
 

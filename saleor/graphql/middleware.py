@@ -1,59 +1,76 @@
 from typing import Optional
 
+import opentracing
+import opentracing.tags
+from django.conf import settings
 from django.contrib.auth.models import AnonymousUser
-from django.shortcuts import reverse
 from django.utils.functional import SimpleLazyObject
-from graphene_django.settings import graphene_settings
+from graphql import ResolveInfo
 from graphql_jwt.middleware import JSONWebTokenMiddleware
 
-from ..account.models import ServiceAccount
+from ..app.models import App
+from ..core.tracing import should_trace
+from .views import API_PATH, GraphQLView
 
 
-def jwt_middleware(get_response):
-    """Authenticate a user using JWT and ignore the session-based authentication.
+class JWTMiddleware(JSONWebTokenMiddleware):
+    def resolve(self, next, root, info, **kwargs):
+        request = info.context
 
-    This middleware resets authentication made by any previous middlewares
-    and authenticates the user
-    with graphql_jwt.middleware.JSONWebTokenMiddleware.
-    """
-    # Disable warnings for django-graphene-jwt
-    graphene_settings.MIDDLEWARE.append(JSONWebTokenMiddleware)
-    jwt_middleware_inst = JSONWebTokenMiddleware(get_response=get_response)
-    graphene_settings.MIDDLEWARE.remove(JSONWebTokenMiddleware)
-
-    def middleware(request):
-        if request.path == reverse("api"):
-            # clear user authenticated by AuthenticationMiddleware
-            request._cached_user = AnonymousUser()
+        if not hasattr(request, "user"):
             request.user = AnonymousUser()
-
-            # authenticate using JWT middleware
-            jwt_middleware_inst.process_request(request)
-        return get_response(request)
-
-    return middleware
+        return super().resolve(next, root, info, **kwargs)
 
 
-def get_service_account(auth_token) -> Optional[ServiceAccount]:
-    qs = ServiceAccount.objects.filter(tokens__auth_token=auth_token, is_active=True)
+class OpentracingGrapheneMiddleware:
+    @staticmethod
+    def resolve(next_, root, info: ResolveInfo, **kwargs):
+        if not should_trace(info):
+            return next_(root, info, **kwargs)
+        operation = f"{info.parent_type.name}.{info.field_name}"
+        with opentracing.global_tracer().start_active_span(operation) as scope:
+            span = scope.span
+            span.set_tag(opentracing.tags.COMPONENT, "graphql")
+            span.set_tag("graphql.parent_type", info.parent_type.name)
+            span.set_tag("graphql.field_name", info.field_name)
+            return next_(root, info, **kwargs)
+
+
+def get_app(auth_token) -> Optional[App]:
+    qs = App.objects.filter(tokens__auth_token=auth_token, is_active=True)
     return qs.first()
 
 
-def service_account_middleware(get_response):
+def app_middleware(next, root, info, **kwargs):
 
-    service_account_auth_header = "HTTP_AUTHORIZATION"
+    app_auth_header = "HTTP_AUTHORIZATION"
     prefix = "bearer"
+    request = info.context
 
-    def middleware(request):
-        if request.path == reverse("api"):
-            request.service_account = None
-            auth = request.META.get(service_account_auth_header, "").split()
+    if request.path == API_PATH:
+        if not hasattr(request, "app"):
+            request.app = None
+            auth = request.META.get(app_auth_header, "").split()
             if len(auth) == 2:
                 auth_prefix, auth_token = auth
                 if auth_prefix.lower() == prefix:
-                    request.service_account = SimpleLazyObject(
-                        lambda: get_service_account(auth_token)
-                    )
-        return get_response(request)
+                    request.app = SimpleLazyObject(lambda: get_app(auth_token))
+    return next(root, info, **kwargs)
 
-    return middleware
+
+def process_view(self, request, view_func, *args):
+    if hasattr(view_func, "view_class") and issubclass(
+        view_func.view_class, GraphQLView
+    ):
+        request._graphql_view = True
+
+
+if settings.ENABLE_DEBUG_TOOLBAR:
+    import warnings
+
+    try:
+        from graphiql_debug_toolbar.middleware import DebugToolbarMiddleware
+    except ImportError:
+        warnings.warn("The graphiql debug toolbar was not installed.")
+    else:
+        DebugToolbarMiddleware.process_view = process_view

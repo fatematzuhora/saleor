@@ -8,14 +8,19 @@ from graphene.utils.str_converters import to_camel_case
 from saleor.product.error_codes import ProductErrorCode
 from saleor.product.models import ProductVariant
 from saleor.product.utils.attributes import associate_attribute_values_to_instance
+from saleor.warehouse.error_codes import StockErrorCode
+from saleor.warehouse.models import Stock, Warehouse
 from tests.api.utils import get_graphql_content
 
 
 def test_fetch_variant(staff_api_client, product, permission_manage_products):
     query = """
-    query ProductVariantDetails($id: ID!) {
+    query ProductVariantDetails($id: ID!, $countyCode: CountryCode) {
         productVariant(id: $id) {
             id
+            stocks(countryCode: $countyCode) {
+                id
+            }
             attributes {
                 attribute {
                     id
@@ -54,24 +59,25 @@ def test_fetch_variant(staff_api_client, product, permission_manage_products):
 
     variant = product.variants.first()
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
-    variables = {"id": variant_id}
+    variables = {"id": variant_id, "countyCode": "EU"}
     staff_api_client.user.user_permissions.add(permission_manage_products)
     response = staff_api_client.post_graphql(query, variables)
     content = get_graphql_content(response)
     data = content["data"]["productVariant"]
     assert data["name"] == variant.name
+    assert len(data["stocks"]) == variant.stocks.count()
 
 
 def test_create_variant(
-    staff_api_client, product, product_type, permission_manage_products
+    staff_api_client, product, product_type, permission_manage_products, warehouse
 ):
     query = """
         mutation createVariant (
             $productId: ID!,
             $sku: String!,
+            $stocks: [StockInput!],
             $priceOverride: Decimal,
             $costPrice: Decimal,
-            $quantity: Int!,
             $attributes: [AttributeValueInput]!,
             $weight: WeightScalar,
             $trackInventory: Boolean!) {
@@ -79,9 +85,9 @@ def test_create_variant(
                     input: {
                         product: $productId,
                         sku: $sku,
+                        stocks: $stocks,
                         priceOverride: $priceOverride,
                         costPrice: $costPrice,
-                        quantity: $quantity,
                         attributes: $attributes,
                         trackInventory: $trackInventory,
                         weight: $weight
@@ -101,7 +107,6 @@ def test_create_variant(
                                 slug
                             }
                         }
-                        quantity
                         priceOverride {
                             currency
                             amount
@@ -116,6 +121,12 @@ def test_create_variant(
                             value
                             unit
                         }
+                        stocks {
+                            quantity
+                            warehouse {
+                                slug
+                            }
+                        }
                     }
                 }
             }
@@ -125,18 +136,23 @@ def test_create_variant(
     sku = "1"
     price_override = 1.32
     cost_price = 3.22
-    quantity = 10
     weight = 10.22
     variant_slug = product_type.variant_attributes.first().slug
     variant_id = graphene.Node.to_global_id(
         "Attribute", product_type.variant_attributes.first().pk
     )
     variant_value = "test-value"
+    stocks = [
+        {
+            "warehouse": graphene.Node.to_global_id("Warehouse", warehouse.pk),
+            "quantity": 20,
+        }
+    ]
 
     variables = {
         "productId": product_id,
         "sku": sku,
-        "quantity": quantity,
+        "stocks": stocks,
         "costPrice": cost_price,
         "priceOverride": price_override,
         "weight": weight,
@@ -150,7 +166,6 @@ def test_create_variant(
     assert not content["productErrors"]
     data = content["productVariant"]
     assert data["name"] == variant_value
-    assert data["quantity"] == quantity
     assert data["costPrice"]["amount"] == cost_price
     assert data["priceOverride"]["amount"] == price_override
     assert data["sku"] == sku
@@ -158,6 +173,53 @@ def test_create_variant(
     assert data["attributes"][0]["values"][0]["slug"] == variant_value
     assert data["weight"]["unit"] == "kg"
     assert data["weight"]["value"] == weight
+    assert len(data["stocks"]) == 1
+    assert data["stocks"][0]["quantity"] == stocks[0]["quantity"]
+    assert data["stocks"][0]["warehouse"]["slug"] == warehouse.slug
+
+
+def test_create_product_variant_with_negative_weight(
+    staff_api_client, product, product_type, permission_manage_products
+):
+    query = """
+        mutation createVariant (
+            $productId: ID!,
+            $attributes: [AttributeValueInput]!,
+            $weight: WeightScalar) {
+                productVariantCreate(
+                    input: {
+                        product: $productId,
+                        attributes: $attributes,
+                        weight: $weight
+                    }) {
+                    productErrors {
+                        field
+                        code
+                        message
+                    }
+                }
+            }
+    """
+    product_id = graphene.Node.to_global_id("Product", product.pk)
+
+    variant_id = graphene.Node.to_global_id(
+        "Attribute", product_type.variant_attributes.first().pk
+    )
+    variant_value = "test-value"
+
+    variables = {
+        "productId": product_id,
+        "weight": -1,
+        "attributes": [{"id": variant_id, "values": [variant_value]}],
+    }
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantCreate"]
+    error = data["productErrors"][0]
+    assert error["field"] == "weight"
+    assert error["code"] == ProductErrorCode.INVALID.name
 
 
 def test_create_product_variant_not_all_attributes(
@@ -211,7 +273,7 @@ def test_create_product_variant_not_all_attributes(
 
 def test_create_product_variant_duplicated_attributes(
     staff_api_client,
-    product_with_two_variants,
+    product_with_variant_with_two_attributes,
     color_attribute,
     size_attribute,
     permission_manage_products,
@@ -236,7 +298,7 @@ def test_create_product_variant_duplicated_attributes(
             }
         }
     """
-    product = product_with_two_variants
+    product = product_with_variant_with_two_attributes
     product_id = graphene.Node.to_global_id("Product", product.pk)
     color_attribute_id = graphene.Node.to_global_id("Attribute", color_attribute.id)
     size_attribute_id = graphene.Node.to_global_id("Attribute", size_attribute.id)
@@ -256,7 +318,7 @@ def test_create_product_variant_duplicated_attributes(
     assert content["data"]["productVariantCreate"]["productErrors"]
     assert content["data"]["productVariantCreate"]["productErrors"][0] == {
         "field": "attributes",
-        "code": ProductErrorCode.UNIQUE.name,
+        "code": ProductErrorCode.DUPLICATED_INPUT_ITEM.name,
         "message": ANY,
     }
     assert not product.variants.filter(sku=sku).exists()
@@ -272,7 +334,6 @@ def test_create_product_variant_update_with_new_attributes(
           $costPrice: Decimal
           $priceOverride: Decimal
           $sku: String
-          $quantity: Int
           $trackInventory: Boolean!
         ) {
           productVariantUpdate(
@@ -282,7 +343,6 @@ def test_create_product_variant_update_with_new_attributes(
               costPrice: $costPrice
               priceOverride: $priceOverride
               sku: $sku
-              quantity: $quantity
               trackInventory: $trackInventory
             }
           ) {
@@ -305,12 +365,6 @@ def test_create_product_variant_update_with_new_attributes(
                   }
                   __typename
                 }
-                value {
-                  id
-                  name
-                  slug
-                  __typename
-                }
                 __typename
               }
             }
@@ -328,7 +382,6 @@ def test_create_product_variant_update_with_new_attributes(
         "costPrice": 10,
         "id": variant_id,
         "priceOverride": 0,
-        "quantity": 4,
         "sku": "21599567",
         "trackInventory": True,
     }
@@ -344,8 +397,6 @@ def test_create_product_variant_update_with_new_attributes(
     attributes = data["productVariant"]["attributes"]
     assert len(attributes) == 1
     assert attributes[0]["attribute"]["id"] == size_attribute_id
-    assert attributes[0]["value"]["name"] == "XXXL"
-    assert attributes[0]["value"]["slug"] == "xxxl"
 
 
 def test_update_product_variant(staff_api_client, product, permission_manage_products):
@@ -354,20 +405,17 @@ def test_update_product_variant(staff_api_client, product, permission_manage_pro
             $id: ID!,
             $sku: String!,
             $costPrice: Decimal,
-            $quantity: Int!,
             $trackInventory: Boolean!) {
                 productVariantUpdate(
                     id: $id,
                     input: {
                         sku: $sku,
                         costPrice: $costPrice,
-                        quantity: $quantity,
                         trackInventory: $trackInventory
                     }) {
                     productVariant {
                         name
                         sku
-                        quantity
                         costPrice {
                             currency
                             amount
@@ -382,12 +430,10 @@ def test_update_product_variant(staff_api_client, product, permission_manage_pro
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
     sku = "test sku"
     cost_price = 3.3
-    quantity = 123
 
     variables = {
         "id": variant_id,
         "sku": sku,
-        "quantity": quantity,
         "costPrice": cost_price,
         "trackInventory": True,
     }
@@ -399,9 +445,49 @@ def test_update_product_variant(staff_api_client, product, permission_manage_pro
     content = get_graphql_content(response)
     data = content["data"]["productVariantUpdate"]["productVariant"]
     assert data["name"] == variant.name
-    assert data["quantity"] == quantity
     assert data["costPrice"]["amount"] == cost_price
     assert data["sku"] == sku
+
+
+def test_update_product_variant_with_negative_weight(
+    staff_api_client, product, permission_manage_products
+):
+    query = """
+        mutation updateVariant (
+            $id: ID!,
+            $weight: WeightScalar
+        ) {
+            productVariantUpdate(
+                id: $id,
+                input: {
+                    weight: $weight
+                }
+            ){
+                productVariant {
+                    name
+                }
+                productErrors {
+                    field
+                    message
+                    code
+                }
+            }
+        }
+    """
+    variant = product.variants.first()
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+
+    variables = {"id": variant_id, "weight": -1}
+
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_products]
+    )
+    variant.refresh_from_db()
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantUpdate"]
+    error = data["productErrors"][0]
+    assert error["field"] == "weight"
+    assert error["code"] == ProductErrorCode.INVALID.name
 
 
 @pytest.mark.parametrize("field", ("cost_price", "price_override"))
@@ -427,7 +513,6 @@ def test_update_product_variant_unset_amounts(
                     productVariant {
                         name
                         sku
-                        quantity
                         costPrice {
                             currency
                             amount
@@ -526,12 +611,12 @@ def test_update_product_variant_not_all_attributes(
 
 def test_update_product_variant_with_current_attribut(
     staff_api_client,
-    product_with_two_variants,
+    product_with_variant_with_two_attributes,
     color_attribute,
     size_attribute,
     permission_manage_products,
 ):
-    product = product_with_two_variants
+    product = product_with_variant_with_two_attributes
     variant = product.variants.first()
     sku = str(uuid4())[:12]
     assert not variant.sku == sku
@@ -568,12 +653,12 @@ def test_update_product_variant_with_current_attribut(
 
 def test_update_product_variant_with_new_attribute(
     staff_api_client,
-    product_with_two_variants,
+    product_with_variant_with_two_attributes,
     color_attribute,
     size_attribute,
     permission_manage_products,
 ):
-    product = product_with_two_variants
+    product = product_with_variant_with_two_attributes
     variant = product.variants.first()
     sku = str(uuid4())[:12]
     assert not variant.sku == sku
@@ -610,12 +695,12 @@ def test_update_product_variant_with_new_attribute(
 
 def test_update_product_variant_with_duplicated_attribute(
     staff_api_client,
-    product_with_two_variants,
+    product_with_variant_with_two_attributes,
     color_attribute,
     size_attribute,
     permission_manage_products,
 ):
-    product = product_with_two_variants
+    product = product_with_variant_with_two_attributes
     variant = product.variants.first()
     variant2 = product.variants.first()
 
@@ -656,7 +741,7 @@ def test_update_product_variant_with_duplicated_attribute(
     data = content["data"]["productVariantUpdate"]
     assert data["productErrors"][0] == {
         "field": "attributes",
-        "code": ProductErrorCode.UNIQUE.name,
+        "code": ProductErrorCode.DUPLICATED_INPUT_ITEM.name,
     }
 
 
@@ -837,10 +922,17 @@ PRODUCT_VARIANT_BULK_CREATE_MUTATION = """
                 message
                 code
                 index
+                warehouses
             }
             productVariants{
                 id
                 sku
+                stocks {
+                    warehouse {
+                        slug
+                    }
+                    quantity
+                }
             }
             count
         }
@@ -860,7 +952,6 @@ def test_product_variant_bulk_create_by_attribute_id(
     variants = [
         {
             "sku": sku,
-            "quantity": 1000,
             "costPrice": None,
             "priceOverride": None,
             "weight": 2.5,
@@ -883,6 +974,35 @@ def test_product_variant_bulk_create_by_attribute_id(
     product_variant = ProductVariant.objects.get(sku=sku)
     assert not product_variant.cost_price
     assert not product_variant.price_override
+
+
+@pytest.mark.parametrize(
+    "price_field", ("priceOverride", "costPrice",),
+)
+def test_product_variant_bulk_create_by_attribute_id_with_invalid_price(
+    staff_api_client, product, size_attribute, permission_manage_products, price_field
+):
+    product_id = graphene.Node.to_global_id("Product", product.pk)
+    attribut_id = graphene.Node.to_global_id("Attribute", size_attribute.pk)
+    attribute_value = size_attribute.values.last()
+    sku = str(uuid4())[:12]
+    variant = {
+        "sku": sku,
+        "weight": 2.5,
+        "trackInventory": True,
+        "attributes": [{"id": attribut_id, "values": [attribute_value.name]}],
+    }
+    variant[price_field] = "-1"
+
+    variables = {"productId": product_id, "variants": [variant]}
+    staff_api_client.user.user_permissions.add(permission_manage_products)
+    response = staff_api_client.post_graphql(
+        PRODUCT_VARIANT_BULK_CREATE_MUTATION, variables
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantBulkCreate"]
+    assert data["bulkProductErrors"][0]["field"] == price_field
+    assert data["bulkProductErrors"][0]["code"] == ProductErrorCode.INVALID.name
 
 
 def test_product_variant_bulk_create_empty_attribute(
@@ -936,22 +1056,44 @@ def test_product_variant_bulk_create_with_new_attribute_value(
     assert attribute_value_count + 1 == size_attribute.values.count()
 
 
-def test_product_variant_bulk_create_negative_quantity(
-    staff_api_client, product, size_attribute, permission_manage_products
+def test_product_variant_bulk_create_stocks_input(
+    staff_api_client, product, permission_manage_products, warehouses, size_attribute
 ):
     product_variant_count = ProductVariant.objects.count()
     product_id = graphene.Node.to_global_id("Product", product.pk)
+    attribute_value_count = size_attribute.values.count()
     size_attribute_id = graphene.Node.to_global_id("Attribute", size_attribute.pk)
+    attribute_value = size_attribute.values.last()
     variants = [
         {
             "sku": str(uuid4())[:12],
-            "quantity": -1000,
-            "attributes": [{"id": size_attribute_id, "values": ["Test-value"]}],
+            "stocks": [
+                {
+                    "quantity": 10,
+                    "warehouse": graphene.Node.to_global_id(
+                        "Warehouse", warehouses[0].pk
+                    ),
+                }
+            ],
+            "attributes": [{"id": size_attribute_id, "values": [attribute_value.name]}],
         },
         {
             "sku": str(uuid4())[:12],
-            "quantity": 100,
-            "attributes": [{"id": size_attribute_id, "values": ["Test-value2"]}],
+            "attributes": [{"id": size_attribute_id, "values": ["Test-attribute"]}],
+            "stocks": [
+                {
+                    "quantity": 15,
+                    "warehouse": graphene.Node.to_global_id(
+                        "Warehouse", warehouses[0].pk
+                    ),
+                },
+                {
+                    "quantity": 15,
+                    "warehouse": graphene.Node.to_global_id(
+                        "Warehouse", warehouses[1].pk
+                    ),
+                },
+            ],
         },
     ]
 
@@ -962,12 +1104,86 @@ def test_product_variant_bulk_create_negative_quantity(
     )
     content = get_graphql_content(response)
     data = content["data"]["productVariantBulkCreate"]
-    assert len(data["bulkProductErrors"]) == 1
-    error = data["bulkProductErrors"][0]
-    assert error["field"] == "quantity"
-    assert error["code"] == ProductErrorCode.INVALID.name
-    assert error["index"] == 0
-    assert product_variant_count == ProductVariant.objects.count()
+    assert not data["bulkProductErrors"]
+    assert data["count"] == 2
+    assert product_variant_count + 2 == ProductVariant.objects.count()
+    assert attribute_value_count + 1 == size_attribute.values.count()
+
+    expected_result = [
+        {
+            "sku": variants[0]["sku"],
+            "stocks": [
+                {
+                    "warehouse": {"slug": warehouses[0].slug},
+                    "quantity": variants[0]["stocks"][0]["quantity"],
+                }
+            ],
+        },
+        {
+            "sku": variants[1]["sku"],
+            "stocks": [
+                {
+                    "warehouse": {"slug": warehouses[0].slug},
+                    "quantity": variants[1]["stocks"][0]["quantity"],
+                },
+                {
+                    "warehouse": {"slug": warehouses[1].slug},
+                    "quantity": variants[1]["stocks"][1]["quantity"],
+                },
+            ],
+        },
+    ]
+    for variant_data in data["productVariants"]:
+        variant_data.pop("id")
+        assert variant_data in expected_result
+
+
+def test_product_variant_bulk_create_duplicated_warehouses(
+    staff_api_client, product, permission_manage_products, warehouses, size_attribute
+):
+    product_id = graphene.Node.to_global_id("Product", product.pk)
+    size_attribute_id = graphene.Node.to_global_id("Attribute", size_attribute.pk)
+    attribute_value = size_attribute.values.last()
+    warehouse1_id = graphene.Node.to_global_id("Warehouse", warehouses[0].pk)
+    variants = [
+        {
+            "sku": str(uuid4())[:12],
+            "stocks": [
+                {
+                    "quantity": 10,
+                    "warehouse": graphene.Node.to_global_id(
+                        "Warehouse", warehouses[1].pk
+                    ),
+                }
+            ],
+            "attributes": [{"id": size_attribute_id, "values": [attribute_value.name]}],
+        },
+        {
+            "sku": str(uuid4())[:12],
+            "attributes": [{"id": size_attribute_id, "values": ["Test-attribute"]}],
+            "stocks": [
+                {"quantity": 15, "warehouse": warehouse1_id},
+                {"quantity": 15, "warehouse": warehouse1_id},
+            ],
+        },
+    ]
+
+    variables = {"productId": product_id, "variants": variants}
+    staff_api_client.user.user_permissions.add(permission_manage_products)
+    response = staff_api_client.post_graphql(
+        PRODUCT_VARIANT_BULK_CREATE_MUTATION, variables
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantBulkCreate"]
+    errors = data["bulkProductErrors"]
+
+    assert not data["productVariants"]
+    assert len(errors) == 1
+    error = errors[0]
+    assert error["field"] == "stocks"
+    assert error["index"] == 1
+    assert error["code"] == ProductErrorCode.DUPLICATED_INPUT_ITEM.name
+    assert error["warehouses"] == [warehouse1_id]
 
 
 def test_product_variant_bulk_create_duplicated_sku(
@@ -1057,22 +1273,18 @@ def test_product_variant_bulk_create_many_errors(
     variants = [
         {
             "sku": str(uuid4())[:12],
-            "quantity": -1000,
             "attributes": [{"id": size_attribute_id, "values": ["Test-value1"]}],
         },
         {
             "sku": str(uuid4())[:12],
-            "quantity": 100,
             "attributes": [{"id": size_attribute_id, "values": ["Test-value4"]}],
         },
         {
             "sku": sku,
-            "quantity": 100,
             "attributes": [{"id": size_attribute_id, "values": ["Test-value2"]}],
         },
         {
             "sku": str(uuid4())[:12],
-            "quantity": 100,
             "attributes": [{"id": invalid_attribute_id, "values": ["Test-value3"]}],
         },
     ]
@@ -1084,26 +1296,22 @@ def test_product_variant_bulk_create_many_errors(
     )
     content = get_graphql_content(response)
     data = content["data"]["productVariantBulkCreate"]
-    assert len(data["bulkProductErrors"]) == 3
+    assert len(data["bulkProductErrors"]) == 2
     errors = data["bulkProductErrors"]
     expected_errors = [
-        {
-            "field": "quantity",
-            "index": 0,
-            "code": ProductErrorCode.INVALID.name,
-            "message": ANY,
-        },
         {
             "field": "sku",
             "index": 2,
             "code": ProductErrorCode.UNIQUE.name,
             "message": ANY,
+            "warehouses": None,
         },
         {
             "field": "attributes",
             "index": 3,
             "code": ProductErrorCode.NOT_FOUND.name,
             "message": ANY,
+            "warehouses": None,
         },
     ]
     for expected_error in expected_errors:
@@ -1113,12 +1321,12 @@ def test_product_variant_bulk_create_many_errors(
 
 def test_product_variant_bulk_create_two_variants_duplicated_attribute_value(
     staff_api_client,
-    product_with_two_variants,
+    product_with_variant_with_two_attributes,
     color_attribute,
     size_attribute,
     permission_manage_products,
 ):
-    product = product_with_two_variants
+    product = product_with_variant_with_two_attributes
     product_variant_count = ProductVariant.objects.count()
     product_id = graphene.Node.to_global_id("Product", product.pk)
     color_attribute_id = graphene.Node.to_global_id("Attribute", color_attribute.id)
@@ -1142,19 +1350,19 @@ def test_product_variant_bulk_create_two_variants_duplicated_attribute_value(
     assert len(data["bulkProductErrors"]) == 1
     error = data["bulkProductErrors"][0]
     assert error["field"] == "attributes"
-    assert error["code"] == ProductErrorCode.UNIQUE.name
+    assert error["code"] == ProductErrorCode.DUPLICATED_INPUT_ITEM.name
     assert error["index"] == 0
     assert product_variant_count == ProductVariant.objects.count()
 
 
 def test_product_variant_bulk_create_two_variants_duplicated_attribute_value_in_input(
     staff_api_client,
-    product_with_two_variants,
+    product_with_variant_with_two_attributes,
     permission_manage_products,
     color_attribute,
     size_attribute,
 ):
-    product = product_with_two_variants
+    product = product_with_variant_with_two_attributes
     product_id = graphene.Node.to_global_id("Product", product.pk)
     product_variant_count = ProductVariant.objects.count()
     color_attribute_id = graphene.Node.to_global_id("Attribute", color_attribute.id)
@@ -1177,19 +1385,19 @@ def test_product_variant_bulk_create_two_variants_duplicated_attribute_value_in_
     assert len(data["bulkProductErrors"]) == 1
     error = data["bulkProductErrors"][0]
     assert error["field"] == "attributes"
-    assert error["code"] == ProductErrorCode.UNIQUE.name
+    assert error["code"] == ProductErrorCode.DUPLICATED_INPUT_ITEM.name
     assert error["index"] == 1
     assert product_variant_count == ProductVariant.objects.count()
 
 
 def test_product_variant_bulk_create_two_variants_duplicated_one_attribute_value(
     staff_api_client,
-    product_with_two_variants,
+    product_with_variant_with_two_attributes,
     color_attribute,
     size_attribute,
     permission_manage_products,
 ):
-    product = product_with_two_variants
+    product = product_with_variant_with_two_attributes
     product_variant_count = ProductVariant.objects.count()
     product_id = graphene.Node.to_global_id("Product", product.pk)
     color_attribute_id = graphene.Node.to_global_id("Attribute", color_attribute.id)
@@ -1213,3 +1421,406 @@ def test_product_variant_bulk_create_two_variants_duplicated_one_attribute_value
     assert not data["bulkProductErrors"]
     assert data["count"] == 1
     assert product_variant_count + 1 == ProductVariant.objects.count()
+
+
+VARIANT_STOCKS_CREATE_MUTATION = """
+    mutation ProductVariantStocksCreate($variantId: ID!, $stocks: [StockInput!]!){
+        productVariantStocksCreate(variantId: $variantId, stocks: $stocks){
+            productVariant{
+                stocks {
+                    quantity
+                    quantityAllocated
+                    id
+                    warehouse{
+                        slug
+                    }
+                }
+            }
+            bulkStockErrors{
+                code
+                field
+                message
+                index
+            }
+        }
+    }
+"""
+
+
+def test_variant_stocks_create(
+    staff_api_client, variant, warehouse, permission_manage_products
+):
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    second_warehouse = Warehouse.objects.get(pk=warehouse.pk)
+    second_warehouse.slug = "second warehouse"
+    second_warehouse.pk = None
+    second_warehouse.save()
+
+    stocks = [
+        {
+            "warehouse": graphene.Node.to_global_id("Warehouse", warehouse.id),
+            "quantity": 20,
+        },
+        {
+            "warehouse": graphene.Node.to_global_id("Warehouse", second_warehouse.id),
+            "quantity": 100,
+        },
+    ]
+    variables = {"variantId": variant_id, "stocks": stocks}
+    response = staff_api_client.post_graphql(
+        VARIANT_STOCKS_CREATE_MUTATION,
+        variables,
+        permissions=[permission_manage_products],
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantStocksCreate"]
+
+    expected_result = [
+        {
+            "quantity": stocks[0]["quantity"],
+            "quantityAllocated": 0,
+            "warehouse": {"slug": warehouse.slug},
+        },
+        {
+            "quantity": stocks[1]["quantity"],
+            "quantityAllocated": 0,
+            "warehouse": {"slug": second_warehouse.slug},
+        },
+    ]
+    assert not data["bulkStockErrors"]
+    assert len(data["productVariant"]["stocks"]) == len(stocks)
+    result = []
+    for stock in data["productVariant"]["stocks"]:
+        stock.pop("id")
+        result.append(stock)
+    for res in result:
+        assert res in expected_result
+
+
+def test_variant_stocks_create_stock_already_exists(
+    staff_api_client, variant, warehouse, permission_manage_products
+):
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    second_warehouse = Warehouse.objects.get(pk=warehouse.pk)
+    second_warehouse.slug = "second warehouse"
+    second_warehouse.pk = None
+    second_warehouse.save()
+
+    Stock.objects.create(product_variant=variant, warehouse=warehouse, quantity=10)
+
+    stocks = [
+        {
+            "warehouse": graphene.Node.to_global_id("Warehouse", warehouse.id),
+            "quantity": 20,
+        },
+        {
+            "warehouse": graphene.Node.to_global_id("Warehouse", second_warehouse.id),
+            "quantity": 100,
+        },
+    ]
+    variables = {"variantId": variant_id, "stocks": stocks}
+    response = staff_api_client.post_graphql(
+        VARIANT_STOCKS_CREATE_MUTATION,
+        variables,
+        permissions=[permission_manage_products],
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantStocksCreate"]
+    errors = data["bulkStockErrors"]
+
+    assert errors
+    assert errors[0]["code"] == StockErrorCode.UNIQUE.name
+    assert errors[0]["field"] == "warehouse"
+    assert errors[0]["index"] == 0
+
+
+def test_variant_stocks_create_stock_duplicated_warehouse(
+    staff_api_client, variant, warehouse, permission_manage_products
+):
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    second_warehouse = Warehouse.objects.get(pk=warehouse.pk)
+    second_warehouse.slug = "second warehouse"
+    second_warehouse.pk = None
+    second_warehouse.save()
+
+    second_warehouse_id = graphene.Node.to_global_id("Warehouse", second_warehouse.id)
+
+    stocks = [
+        {
+            "warehouse": graphene.Node.to_global_id("Warehouse", warehouse.id),
+            "quantity": 20,
+        },
+        {"warehouse": second_warehouse_id, "quantity": 100},
+        {"warehouse": second_warehouse_id, "quantity": 120},
+    ]
+    variables = {"variantId": variant_id, "stocks": stocks}
+    response = staff_api_client.post_graphql(
+        VARIANT_STOCKS_CREATE_MUTATION,
+        variables,
+        permissions=[permission_manage_products],
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantStocksCreate"]
+    errors = data["bulkStockErrors"]
+
+    assert errors
+    assert errors[0]["code"] == StockErrorCode.UNIQUE.name
+    assert errors[0]["field"] == "warehouse"
+    assert errors[0]["index"] == 2
+
+
+def test_variant_stocks_create_stock_duplicated_warehouse_and_warehouse_already_exists(
+    staff_api_client, variant, warehouse, permission_manage_products
+):
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    second_warehouse = Warehouse.objects.get(pk=warehouse.pk)
+    second_warehouse.slug = "second warehouse"
+    second_warehouse.pk = None
+    second_warehouse.save()
+
+    second_warehouse_id = graphene.Node.to_global_id("Warehouse", second_warehouse.id)
+    Stock.objects.create(
+        product_variant=variant, warehouse=second_warehouse, quantity=10
+    )
+
+    stocks = [
+        {
+            "warehouse": graphene.Node.to_global_id("Warehouse", warehouse.id),
+            "quantity": 20,
+        },
+        {"warehouse": second_warehouse_id, "quantity": 100},
+        {"warehouse": second_warehouse_id, "quantity": 120},
+    ]
+
+    variables = {"variantId": variant_id, "stocks": stocks}
+    response = staff_api_client.post_graphql(
+        VARIANT_STOCKS_CREATE_MUTATION,
+        variables,
+        permissions=[permission_manage_products],
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantStocksCreate"]
+    errors = data["bulkStockErrors"]
+
+    assert len(errors) == 3
+    assert {error["code"] for error in errors} == {
+        StockErrorCode.UNIQUE.name,
+    }
+    assert {error["field"] for error in errors} == {
+        "warehouse",
+    }
+    assert {error["index"] for error in errors} == {1, 2}
+
+
+VARIANT_STOCKS_UPDATE_MUTATIONS = """
+    mutation ProductVariantStocksUpdate($variantId: ID!, $stocks: [StockInput!]!){
+        productVariantStocksUpdate(variantId: $variantId, stocks: $stocks){
+            productVariant{
+                stocks{
+                    quantity
+                    quantityAllocated
+                    id
+                    warehouse{
+                        slug
+                    }
+                }
+            }
+            bulkStockErrors{
+                code
+                field
+                message
+                index
+            }
+        }
+    }
+"""
+
+
+def test_product_variant_stocks_update(
+    staff_api_client, variant, warehouse, permission_manage_products
+):
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    second_warehouse = Warehouse.objects.get(pk=warehouse.pk)
+    second_warehouse.slug = "second warehouse"
+    second_warehouse.pk = None
+    second_warehouse.save()
+
+    Stock.objects.create(product_variant=variant, warehouse=warehouse, quantity=10)
+
+    stocks = [
+        {
+            "warehouse": graphene.Node.to_global_id("Warehouse", warehouse.id),
+            "quantity": 20,
+        },
+        {
+            "warehouse": graphene.Node.to_global_id("Warehouse", second_warehouse.id),
+            "quantity": 100,
+        },
+    ]
+    variables = {"variantId": variant_id, "stocks": stocks}
+    response = staff_api_client.post_graphql(
+        VARIANT_STOCKS_UPDATE_MUTATIONS,
+        variables,
+        permissions=[permission_manage_products],
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantStocksUpdate"]
+
+    expected_result = [
+        {
+            "quantity": stocks[0]["quantity"],
+            "quantityAllocated": 0,
+            "warehouse": {"slug": warehouse.slug},
+        },
+        {
+            "quantity": stocks[1]["quantity"],
+            "quantityAllocated": 0,
+            "warehouse": {"slug": second_warehouse.slug},
+        },
+    ]
+    assert not data["bulkStockErrors"]
+    assert len(data["productVariant"]["stocks"]) == len(stocks)
+    result = []
+    for stock in data["productVariant"]["stocks"]:
+        stock.pop("id")
+        result.append(stock)
+    for res in result:
+        assert res in expected_result
+
+
+def test_variant_stocks_update_stock_duplicated_warehouse(
+    staff_api_client, variant, warehouse, permission_manage_products
+):
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    second_warehouse = Warehouse.objects.get(pk=warehouse.pk)
+    second_warehouse.slug = "second warehouse"
+    second_warehouse.pk = None
+    second_warehouse.save()
+
+    Stock.objects.create(product_variant=variant, warehouse=warehouse, quantity=10)
+
+    stocks = [
+        {
+            "warehouse": graphene.Node.to_global_id("Warehouse", warehouse.pk),
+            "quantity": 20,
+        },
+        {
+            "warehouse": graphene.Node.to_global_id("Warehouse", second_warehouse.pk),
+            "quantity": 100,
+        },
+        {
+            "warehouse": graphene.Node.to_global_id("Warehouse", warehouse.pk),
+            "quantity": 150,
+        },
+    ]
+    variables = {"variantId": variant_id, "stocks": stocks}
+    response = staff_api_client.post_graphql(
+        VARIANT_STOCKS_UPDATE_MUTATIONS,
+        variables,
+        permissions=[permission_manage_products],
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantStocksUpdate"]
+    errors = data["bulkStockErrors"]
+
+    assert errors
+    assert errors[0]["code"] == StockErrorCode.UNIQUE.name
+    assert errors[0]["field"] == "warehouse"
+    assert errors[0]["index"] == 2
+
+
+VARIANT_STOCKS_DELETE_MUTATION = """
+    mutation ProductVariantStocksDelete($variantId: ID!, $warehouseIds: [ID!]!){
+        productVariantStocksDelete(
+            variantId: $variantId, warehouseIds: $warehouseIds
+        ){
+            productVariant{
+                stocks{
+                    id
+                    quantity
+                    warehouse{
+                        slug
+                    }
+                }
+            }
+            stockErrors{
+                field
+                code
+                message
+            }
+        }
+    }
+"""
+
+
+def test_product_variant_stocks_delete_mutation(
+    staff_api_client, variant, warehouse, permission_manage_products
+):
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    second_warehouse = Warehouse.objects.get(pk=warehouse.pk)
+    second_warehouse.slug = "second warehouse"
+    second_warehouse.pk = None
+    second_warehouse.save()
+
+    Stock.objects.bulk_create(
+        [
+            Stock(product_variant=variant, warehouse=warehouse, quantity=10),
+            Stock(product_variant=variant, warehouse=second_warehouse, quantity=140),
+        ]
+    )
+    stocks_count = variant.stocks.count()
+
+    warehouse_ids = [graphene.Node.to_global_id("Warehouse", second_warehouse.id)]
+
+    variables = {"variantId": variant_id, "warehouseIds": warehouse_ids}
+    response = staff_api_client.post_graphql(
+        VARIANT_STOCKS_DELETE_MUTATION,
+        variables,
+        permissions=[permission_manage_products],
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantStocksDelete"]
+
+    variant.refresh_from_db()
+    assert not data["stockErrors"]
+    assert (
+        len(data["productVariant"]["stocks"])
+        == variant.stocks.count()
+        == stocks_count - 1
+    )
+    assert data["productVariant"]["stocks"][0]["quantity"] == 10
+    assert data["productVariant"]["stocks"][0]["warehouse"]["slug"] == warehouse.slug
+
+
+def test_product_variant_stocks_delete_mutation_invalid_warehouse_id(
+    staff_api_client, variant, warehouse, permission_manage_products
+):
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    second_warehouse = Warehouse.objects.get(pk=warehouse.pk)
+    second_warehouse.slug = "second warehouse"
+    second_warehouse.pk = None
+    second_warehouse.save()
+
+    Stock.objects.bulk_create(
+        [Stock(product_variant=variant, warehouse=warehouse, quantity=10)]
+    )
+    stocks_count = variant.stocks.count()
+
+    warehouse_ids = [graphene.Node.to_global_id("Warehouse", second_warehouse.id)]
+
+    variables = {"variantId": variant_id, "warehouseIds": warehouse_ids}
+    response = staff_api_client.post_graphql(
+        VARIANT_STOCKS_DELETE_MUTATION,
+        variables,
+        permissions=[permission_manage_products],
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["productVariantStocksDelete"]
+
+    variant.refresh_from_db()
+    assert not data["stockErrors"]
+    assert (
+        len(data["productVariant"]["stocks"]) == variant.stocks.count() == stocks_count
+    )
+    assert data["productVariant"]["stocks"][0]["quantity"] == 10
+    assert data["productVariant"]["stocks"][0]["warehouse"]["slug"] == warehouse.slug

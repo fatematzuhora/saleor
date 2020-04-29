@@ -1,10 +1,9 @@
-from typing import Set
+from typing import Union
 
 from django.conf import settings
 from django.contrib.auth.models import (
     AbstractBaseUser,
     BaseUserManager,
-    Permission,
     PermissionsMixin,
 )
 from django.contrib.postgres.fields import JSONField
@@ -12,13 +11,12 @@ from django.db import models
 from django.db.models import Q, Value
 from django.forms.models import model_to_dict
 from django.utils import timezone
-from django.utils.translation import gettext_lazy as _, pgettext_lazy
 from django_countries.fields import Country, CountryField
-from oauthlib.common import generate_token
 from phonenumber_field.modelfields import PhoneNumber, PhoneNumberField
 from versatileimagefield.fields import VersatileImageField
 
 from ..core.models import ModelWithMetadata
+from ..core.permissions import AccountPermissions, BasePermissionEnum
 from ..core.utils.json_serializer import CustomJsonEncoder
 from . import CustomerEvents
 from .validators import validate_possible_number
@@ -156,16 +154,10 @@ class User(PermissionsMixin, ModelWithMetadata, AbstractBaseUser):
     objects = UserManager()
 
     class Meta:
+        ordering = ("email",)
         permissions = (
-            (
-                "manage_users",
-                pgettext_lazy("Permission description", "Manage customers."),
-            ),
-            ("manage_staff", pgettext_lazy("Permission description", "Manage staff.")),
-            (
-                "impersonate_users",
-                pgettext_lazy("Permission description", "Impersonate customers."),
-            ),
+            (AccountPermissions.MANAGE_USERS.codename, "Manage customers."),
+            (AccountPermissions.MANAGE_STAFF.codename, "Manage staff."),
         )
 
     def get_full_name(self):
@@ -181,69 +173,10 @@ class User(PermissionsMixin, ModelWithMetadata, AbstractBaseUser):
     def get_short_name(self):
         return self.email
 
-    def get_ajax_label(self):
-        address = self.default_billing_address
-        if address:
-            return "%s %s (%s)" % (address.first_name, address.last_name, self.email)
-        return self.email
-
-
-class ServiceAccount(ModelWithMetadata):
-    name = models.CharField(max_length=60)
-    created = models.DateTimeField(auto_now_add=True)
-    is_active = models.BooleanField(default=True)
-    permissions = models.ManyToManyField(
-        Permission,
-        verbose_name=_("service account permissions"),
-        blank=True,
-        help_text=_("Specific permissions for this service."),
-        related_name="service_set",
-        related_query_name="service",
-    )
-
-    class Meta:
-        permissions = (
-            (
-                "manage_service_accounts",
-                pgettext_lazy("Permission description", "Manage service account"),
-            ),
-        )
-
-    def _get_permissions(self) -> Set[str]:
-        """Return the permissions of the service."""
-        if not self.is_active:
-            return set()
-        perm_cache_name = "_service_perm_cache"
-        if not hasattr(self, perm_cache_name):
-            perms = self.permissions.all()
-            perms = perms.values_list("content_type__app_label", "codename").order_by()
-            setattr(self, perm_cache_name, {f"{ct}.{name}" for ct, name in perms})
-        return getattr(self, perm_cache_name)
-
-    def has_perms(self, perm_list):
-        """Return True if the service has each of the specified permissions."""
-        if not self.is_active:
-            return False
-
-        wanted_perms = set(perm_list)
-        actual_perms = self._get_permissions()
-
-        return (wanted_perms & actual_perms) == wanted_perms
-
-    def has_perm(self, perm):
-        """Return True if the service has the specified permission."""
-        if not self.is_active:
-            return False
-
-        return perm in self._get_permissions()
-
-
-class ServiceAccountToken(models.Model):
-    service_account = models.ForeignKey(
-        ServiceAccount, on_delete=models.CASCADE, related_name="tokens"
-    )
-    name = models.CharField(blank=True, default="", max_length=128)
-    auth_token = models.CharField(default=generate_token, unique=True, max_length=30)
+    def has_perm(self, perm: Union[BasePermissionEnum, str], obj=None):  # type: ignore
+        # This method is overridden to accept perm as BasePermissionEnum
+        perm_value = perm.value if hasattr(perm, "value") else perm  # type: ignore
+        return super().has_perm(perm_value, obj)
 
 
 class CustomerNote(models.Model):
@@ -282,3 +215,21 @@ class CustomerEvent(models.Model):
 
     def __repr__(self):
         return f"{self.__class__.__name__}(type={self.type!r}, user={self.user!r})"
+
+
+class StaffNotificationRecipient(models.Model):
+    user = models.OneToOneField(
+        User,
+        related_name="staff_notification",
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
+    )
+    staff_email = models.EmailField(unique=True, blank=True, null=True)
+    active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ("staff_email",)
+
+    def get_email(self):
+        return self.user.email if self.user else self.staff_email
