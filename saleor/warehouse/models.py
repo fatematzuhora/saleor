@@ -8,7 +8,7 @@ from django.db.models.functions import Coalesce
 
 from ..account.models import Address
 from ..order.models import OrderLine
-from ..product.models import ProductVariant
+from ..product.models import Product, ProductVariant
 from ..shipping.models import ShippingZone
 
 
@@ -27,20 +27,18 @@ class WarehouseQueryset(models.QuerySet):
 class Warehouse(models.Model):
     id = models.UUIDField(default=uuid.uuid4, primary_key=True)
     name = models.CharField(max_length=250)
-    slug = models.SlugField(max_length=255, unique=True)
+    slug = models.SlugField(max_length=255, unique=True, allow_unicode=True)
     company_name = models.CharField(blank=True, max_length=255)
-
     shipping_zones = models.ManyToManyField(
         ShippingZone, blank=True, related_name="warehouses"
     )
     address = models.ForeignKey(Address, on_delete=models.PROTECT)
-
     email = models.EmailField(blank=True, default="")
 
     objects = WarehouseQueryset.as_manager()
 
     class Meta:
-        ordering = ("-name",)
+        ordering = ("-slug",)
 
     def __str__(self):
         return self.name
@@ -82,6 +80,11 @@ class StockQuerySet(models.QuerySet):
         """
         return self.for_country(country_code).filter(product_variant=product_variant)
 
+    def get_product_stocks_for_country(self, country_code: str, product: Product):
+        return self.for_country(country_code).filter(
+            product_variant__product_id=product.pk
+        )
+
 
 class Stock(models.Model):
     warehouse = models.ForeignKey(Warehouse, null=False, on_delete=models.CASCADE)
@@ -95,9 +98,6 @@ class Stock(models.Model):
     class Meta:
         unique_together = [["warehouse", "product_variant"]]
         ordering = ("pk",)
-
-    def __str__(self):
-        return f"{self.product_variant} - {self.warehouse.name}"
 
     def increase_stock(self, quantity: int, commit: bool = True):
         """Return given quantity of product to a stock."""

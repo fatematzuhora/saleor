@@ -1,5 +1,5 @@
 import graphene
-from django.db.models import Count, IntegerField, OuterRef, QuerySet, Subquery
+from django.db.models import Count, IntegerField, Min, OuterRef, QuerySet, Subquery
 from django.db.models.functions import Coalesce
 
 from ...product.models import Category, Product
@@ -131,7 +131,7 @@ class CollectionSortingInput(SortInputObjectType):
 
 class ProductOrderField(graphene.Enum):
     NAME = ["name", "slug"]
-    PRICE = ["price_amount", "name", "slug"]
+    PRICE = ["min_variants_price_amount", "name", "slug"]
     MINIMAL_PRICE = ["minimal_variant_price_amount", "name", "slug"]
     DATE = ["updated_at", "name", "slug"]
     TYPE = ["product_type__name", "name", "slug"]
@@ -154,6 +154,12 @@ class ProductOrderField(graphene.Enum):
             return f"Sort products by {descriptions[self.name]}."
         raise ValueError("Unsupported enum value: %s" % self.value)
 
+    @staticmethod
+    def qs_with_price(queryset: QuerySet) -> QuerySet:
+        return queryset.annotate(
+            min_variants_price_amount=Min("variants__price_amount")
+        )
+
 
 class ProductOrder(SortInputObjectType):
     attribute_id = graphene.Argument(
@@ -164,7 +170,7 @@ class ProductOrder(SortInputObjectType):
         ),
     )
     field = graphene.Argument(
-        ProductOrderField, description=f"Sort products by the selected field."
+        ProductOrderField, description="Sort products by the selected field."
     )
 
     class Meta:

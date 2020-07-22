@@ -4,6 +4,41 @@ All notable, unreleased changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Features
+
+- Merge `manage_webhooks` permission with `manage_apps` - #5556 by @korycins
+- Add App support - #5767 by @korycins
+- Add webhook handler to BasePlugin and PluginManager - #5884 by @korycins
+- Invoices backend - #5732 by @tomaszszymanski129
+
+### Breaking Changes
+
+- Refactor JWT support - These changes could require a handling JWT token in the storefront. Storefront needs to handle a case when the backend returns the exception about the invalid token. - #5734, #5816 by @korycins
+- New logging setup will now output JSON logs in production mode for ease of feeding them into log collection systems like Logstash or CloudWatch Logs - #5699 by @patrys
+- Deprecate `WebhookEventType.CHECKOUT_QUANTITY_CHANGED`. It will be removed in Saleor 3.0 - #5837 by @korycins
+- Add dummy credit card payment - #5822 by @IKarbowiak
+
+### Fixes
+
+- Fix payment fields in order paylaod for webhooks - #5862 by @korycins
+- Add our implementation of UUID scalar - #5646 by @koradon
+- Add AppTokenVerify mutation - #5716 by @korycins
+- Fix specific product voucher in draft orders - #5727 by @fowczarek
+- Add products csv export - #5255 by @IKarbowiak
+- Explicit country assignment in default shipping zones - #5736 by @maarcingebala
+- Drop `json_content` field from the `Menu` model - #5761 by @maarcingebala
+- Strip warehouse name in mutations - #5766 by @koradon
+- Add missing OrderEvents during checkout flow - #5684 by @koradon
+- Update google merchant to get tax rate based by plugin manager - #5823 by @gabmartinez
+- Allow unicode in slug fields - #5877 by @IKarbowiak
+
+## 2.10.1
+
+- Fix multiplied stock quantity - #5675 by @fowczarek
+- Fix invalid allocation after migration - #5678 by @fowczarek
+- Fix order mutations as app - #5680 by @fowczarek
+- Prevent creating checkout/draft order with unpublished product - #5676 by @d-wysocki
+
 ## 2.10.0
 
 - OpenTracing support - #5188 by @tomaszszymanski129
@@ -106,6 +141,15 @@ All notable, unreleased changes to this project will be documented in this file.
 - Refactor `OrderCancel` mutation for multiple warehouses - #5554 by @fowczarek
 - Add negative weight validation - #5564 by @fowczarek
 - Add error when user pass empty object as address - #5585 by @fowczarek
+- Fix payment creation without shipping method - #5444 by @d-wysocki
+- Fix checkout and order flow with variant without inventory tracking - #5599 by @fowczarek
+- Fixed JWT expired token being flagged as unhandled error rather than handled. - #5603 by @NyanKiyoshi
+- Refactor read-only middleware - #5602 by @maarcingebala
+- Fix availability for variants without inventory tracking - #5605 by @fowczarek
+- Drop support for configuring Vatlayer plugin from settings file. - #5614 by @korycins
+- Add ability to query category, collection or product by slug - #5574 by @koradon
+- Add `quantityAvailable` field to `ProductVariant` type - #5628 by @fowczarek
+- Use tags rather than time-based logs for information on requests - #5608 by @NyanKiyoshi
 
 ## 2.9.0
 

@@ -1,13 +1,14 @@
 import graphene
-from graphql_jwt.exceptions import PermissionDenied
 from promise import Promise
 
 from ...checkout import calculations, models
 from ...checkout.utils import get_valid_shipping_methods_for_checkout
+from ...core.exceptions import PermissionDenied
 from ...core.permissions import AccountPermissions, CheckoutPermissions
 from ...core.taxes import display_gross_prices, zero_taxed_money
 from ...plugins.manager import get_plugins_manager
 from ..core.connection import CountableDjangoObjectType
+from ..core.scalars import UUID
 from ..core.types.money import TaxedMoney
 from ..decorators import permission_required
 from ..discount.dataloaders import DiscountsByDateTimeLoader
@@ -33,6 +34,11 @@ class PaymentGateway(graphene.ObjectType):
         graphene.NonNull(GatewayConfigLine),
         required=True,
         description="Payment gateway client configuration.",
+    )
+    currencies = graphene.List(
+        graphene.String,
+        required=True,
+        description="Payment gateway supported currencies.",
     )
 
     class Meta:
@@ -109,6 +115,7 @@ class Checkout(CountableDjangoObjectType):
         TaxedMoney,
         description="The price of the checkout before shipping, with taxes included.",
     )
+    token = graphene.Field(UUID, description=("The checkout's token."), required=True)
     total_price = graphene.Field(
         TaxedMoney,
         description=(
@@ -129,7 +136,6 @@ class Checkout(CountableDjangoObjectType):
             "quantity",
             "shipping_address",
             "shipping_method",
-            "token",
             "translated_discount_name",
             "user",
             "voucher_code",
@@ -236,8 +242,8 @@ class Checkout(CountableDjangoObjectType):
         )
 
     @staticmethod
-    def resolve_available_payment_gateways(_: models.Checkout, _info):
-        return [gtw for gtw in get_plugins_manager().list_payment_gateways()]
+    def resolve_available_payment_gateways(root: models.Checkout, _info):
+        return get_plugins_manager().checkout_available_payment_gateways(checkout=root)
 
     @staticmethod
     def resolve_gift_cards(root: models.Checkout, _info):

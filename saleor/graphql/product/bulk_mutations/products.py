@@ -176,15 +176,15 @@ class ProductVariantBulkCreate(BaseMutation):
                 )
             cleaned_input["cost_price_amount"] = cost_price_amount
 
-        price_override_amount = cleaned_input.pop("price_override", None)
-        if price_override_amount is not None:
-            if price_override_amount < 0:
-                errors["priceOverride"] = ValidationError(
+        price_amount = cleaned_input.pop("price", None)
+        if price_amount is not None:
+            if price_amount < 0:
+                errors["price"] = ValidationError(
                     "Product price cannot be lower than 0.",
                     code=ProductErrorCode.INVALID.value,
                     params={"index": variant_index},
                 )
-            cleaned_input["price_override_amount"] = price_override_amount
+            cleaned_input["price_amount"] = price_amount
 
         attributes = cleaned_input.get("attributes")
         if attributes:
@@ -437,14 +437,15 @@ class ProductVariantStocksUpdate(ProductVariantStocksCreate):
         variant = cls.get_node_or_error(
             info, data["variant_id"], only_type=ProductVariant
         )
-        warehouse_ids = [stock["warehouse"] for stock in stocks]
-        cls.check_for_duplicates(warehouse_ids, errors)
-        if errors:
-            raise ValidationError(errors)
-        warehouses = cls.get_nodes_or_error(
-            warehouse_ids, "warehouse", only_type=Warehouse
-        )
-        cls.update_or_create_variant_stocks(variant, stocks, warehouses)
+        if stocks:
+            warehouse_ids = [stock["warehouse"] for stock in stocks]
+            cls.check_for_duplicates(warehouse_ids, errors)
+            if errors:
+                raise ValidationError(errors)
+            warehouses = cls.get_nodes_or_error(
+                warehouse_ids, "warehouse", only_type=Warehouse
+            )
+            cls.update_or_create_variant_stocks(variant, stocks, warehouses)
         return cls(product_variant=variant)
 
     @classmethod

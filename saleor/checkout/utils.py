@@ -15,6 +15,7 @@ from ..account.models import User
 from ..account.utils import store_user_address
 from ..checkout import calculations
 from ..checkout.error_codes import CheckoutErrorCode
+from ..core.exceptions import ProductNotPublished
 from ..core.taxes import quantize_price, zero_taxed_money
 from ..core.utils.promo_code import (
     InvalidPromoCode,
@@ -26,6 +27,7 @@ from ..discount.models import NotApplicable, Voucher
 from ..discount.utils import (
     add_voucher_usage_by_customer,
     decrease_voucher_usage,
+    get_discounted_lines,
     get_products_voucher_discount,
     increase_voucher_usage,
     remove_voucher_usage_by_customer,
@@ -44,23 +46,6 @@ from ..warehouse.availability import check_stock_quantity
 from ..warehouse.management import allocate_stock
 from . import AddressType
 from .models import Checkout, CheckoutLine
-
-COOKIE_NAME = "checkout"
-
-
-def get_checkout_from_request(request, checkout_queryset=Checkout.objects.all()):
-    """Fetch checkout from database or return a new instance based on cookie."""
-    if request.user.is_authenticated:
-        checkout, _ = get_user_checkout(request.user, checkout_queryset)
-        user = request.user
-    else:
-        token = request.get_signed_cookie(COOKIE_NAME, default=None)
-        checkout = get_anonymous_checkout_from_token(token, checkout_queryset)
-        user = None
-    if checkout is None:
-        checkout = Checkout(user=user)
-    checkout.set_country(request.country)
-    return checkout
 
 
 def get_user_checkout(
@@ -82,11 +67,6 @@ def get_user_checkout(
     return checkout_queryset.filter(user=user).first(), False
 
 
-def get_anonymous_checkout_from_token(token, checkout_queryset=Checkout.objects.all()):
-    """Return an open unassigned checkout with given token if any."""
-    return checkout_queryset.filter(token=token, user=None).first()
-
-
 def update_checkout_quantity(checkout):
     """Update the total quantity in checkout."""
     total_lines = checkout.lines.aggregate(total_quantity=Sum("quantity"))[
@@ -96,9 +76,6 @@ def update_checkout_quantity(checkout):
         total_lines = 0
     checkout.quantity = total_lines
     checkout.save(update_fields=["quantity"])
-
-    manager = get_plugins_manager()
-    manager.checkout_quantity_changed(checkout)
 
 
 def check_variant_in_stock(
@@ -129,6 +106,8 @@ def add_variant_to_checkout(
     If `replace` is truthy then any previous quantity is discarded instead
     of added to.
     """
+    if not variant.product.is_published:
+        raise ProductNotPublished()
 
     new_quantity, line = check_variant_in_stock(
         checkout,
@@ -255,28 +234,8 @@ def get_prices_of_discounted_specific_product(
     Product must be assigned directly to the discounted category, assigning
     product to child category won't work.
     """
-    discounted_products = voucher.products.all()
-    discounted_categories = set(voucher.categories.all())
-    discounted_collections = set(voucher.collections.all())
-
     line_prices = []
-    discounted_lines = []
-    if discounted_products or discounted_collections or discounted_categories:
-        for line in lines:
-            line_product = line.variant.product
-            line_category = line.variant.product.category
-            line_collections = set(line.variant.product.collections.all())
-            if line.variant and (
-                line_product in discounted_products
-                or line_category in discounted_categories
-                or line_collections.intersection(discounted_collections)
-            ):
-                discounted_lines.append(line)
-    else:
-        # If there's no discounted products, collections or categories,
-        # it means that all products are discounted
-        discounted_lines.extend(list(lines))
-
+    discounted_lines = get_discounted_lines(lines, voucher)
     for line in discounted_lines:
         line_total = calculations.checkout_line_total(
             line=line, discounts=discounts or []
@@ -845,3 +804,7 @@ def clean_checkout(
             "Provided payment methods can not cover the checkout's total amount",
             code=CheckoutErrorCode.CHECKOUT_NOT_FULLY_PAID.value,
         )
+
+
+def cancel_active_payments(checkout: Checkout):
+    checkout.payments.filter(is_active=True).update(is_active=False)

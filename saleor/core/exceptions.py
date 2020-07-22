@@ -24,3 +24,18 @@ class ReadOnlyException(Exception):
         if msg is None:
             msg = "API runs in read-only mode"
         super().__init__(msg)
+
+
+class ProductNotPublished(Exception):
+    def __init__(self, context=None):
+        super().__init__("Can't add unpublished product.")
+        self.context = context
+        self.code = CheckoutErrorCode.PRODUCT_NOT_PUBLISHED
+
+
+class PermissionDenied(Exception):
+    def __init__(self, message=None):
+        default_message = "You do not have permission to perform this action"
+        if message is None:
+            message = default_message
+        super().__init__(message)
